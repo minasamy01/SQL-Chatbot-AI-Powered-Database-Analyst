@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, text
 from langchain_google_genai import GoogleGenerativeAI
 import re
 import os
+import json
 from dotenv import load_dotenv
 
 # تحميل المتغيرات من ملف .env
@@ -12,7 +13,6 @@ load_dotenv()
 # ------------------- CONFIG -------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 DB_URL = os.getenv("DB_URL")
-
 
 st.set_page_config(page_title="SQL Chatbot", page_icon=":bar_chart:", layout="wide")
 st.title("Chat with Postgres DB :bar_chart:")
@@ -60,36 +60,61 @@ llm = get_llm()
 def clean_sql(sql_text: str) -> str:
     """
     Clean LLM output before executing as SQL.
-    - Removes ```sql code fences
-    - Strips leading/trailing whitespace
     """
     sql_text = re.sub(r"```sql", "", sql_text, flags=re.IGNORECASE)
     sql_text = re.sub(r"```", "", sql_text)
     return sql_text.strip()
 
+def get_few_shot_examples(file_path="fewshots.json"):
+    """
+    Reads examples from JSON and formats them for the prompt.
+    """
+    try:
+        if not os.path.exists(file_path):
+            return ""
+        with open(file_path, "r", encoding="utf-8") as f:
+            examples = json.load(f)
+        
+        formatted_examples = "\n### EXAMPLES OF QUESTIONS AND SQL QUERIES:\n"
+        for ex in examples:
+            # استخدام .get لضمان عدم حدوث خطأ إذا اختلف المسمى قليلاً
+            question = ex.get("naturalQuestion")
+            sql = ex.get("sqlQuery")
+            if question and sql:
+                formatted_examples += f"Question: {question}\n"
+                formatted_examples += f"SQL: {sql}\n\n"
+        return formatted_examples
+    except Exception as e:
+        st.error(f"Error loading few-shot file: {e}")
+        return ""
+
 # ------------------- SQL GENERATION -------------------
 def generate_sql_query(user_question, schema):
+    # تحميل الأمثلة
+    few_shots = get_few_shot_examples("fewshots.json")
+
     prompt = f"""
 You are an expert PostgreSql Data Analyst.
 
 Here is the database schema:
 {schema}
 
-Your task is to write a SQL query that answers the following question:
-{user_question}
-
 CRITICAL RULES:
 1. The tables were created via pandas and are Case-Sensitive.
 2. ALWAYS surround ALL table names and column names with double quotes (e.g., "Customer", "CustomerId").
-3. If joining tables with identical column names (e.g., "FirstName"), ALWAYS use Aliases to make them unique (e.g., "EmployeeFirstName", "CustomerFirstName").
-4. Return ONLY the SQL query without any Markdown formatting, explanations, or comments.
-5. POSTGRES TYPE CASTING (VERY IMPORTANT):
-   - Since tables were loaded from CSV/Pandas, columns might be TEXT.
-   - For ANY date operations (EXTRACT, DATE_PART), you MUST cast the column: "InvoiceDate"::timestamp.
-   - For ANY mathematical operations (+, -, *, SUM, AVG) on price/total columns, you MUST cast to numeric: "Total"::numeric or "UnitPrice"::numeric.
-   - Example: SUM("Total"::numeric) or EXTRACT(YEAR FROM "InvoiceDate"::timestamp).
-"""
+3. If joining tables with identical column names, ALWAYS use Aliases.
+4. Return ONLY the SQL query without any Markdown formatting or comments.
+5. POSTGRES TYPE CASTING (ESSENTIAL):
+   - For dates: "ColumnName"::timestamp
+   - For math: "ColumnName"::numeric
 
+{few_shots}
+
+### NOW YOUR TURN:
+Your task is to write a SQL query that answers the following question:
+Question: {user_question}
+SQL:
+"""
     try:
         response = llm.invoke(prompt)
         return clean_sql(response)
@@ -99,12 +124,9 @@ CRITICAL RULES:
 
 # ------------------- NATURAL LANGUAGE RESPONSE -------------------
 def get_natural_language_response(question, data_df):
-    # نأخذ أول 15 صفاً فقط لضمان بقاء البيانات ضمن حدود استيعاب النموذج
-    # ونستخدم to_markdown لجعل الجدول منظماً جداً للـ LLM
     try:
         limited_data = data_df.head(15).to_markdown(index=False)
     except:
-        # في حال عدم توفر مكتبة tabulate، نستخدم to_string كبديل
         limited_data = data_df.head(15).to_string(index=False)
 
     prompt = f"""
@@ -116,9 +138,8 @@ Below is a table containing the SQL query results (showing up to 15 rows):
 
 Instructions:
 1. Answer the user's question directly and clearly based on the data above.
-2. If the data contains numbers (like sales, totals, or counts), include them in your answer.
-3. If the result is a list of names, summarize them.
-4. Keep your tone professional and concise.
+2. If the data contains numbers, include them in your answer.
+3. Keep your tone professional and concise.
 """
     try:
         response = llm.invoke(prompt)
@@ -126,7 +147,6 @@ Instructions:
     except Exception as e:
         st.error(f"Error generating natural language response: {e}")
         return "Error generating response."
-    
 
 # ------------------- STREAMLIT APP -------------------
 if __name__ == "__main__":
@@ -136,31 +156,25 @@ if __name__ == "__main__":
 
     user_question = st.text_input("Ask a question about the database:")
     if st.button("Get Answer") and user_question:
-        # Generate SQL query
         sql_query = generate_sql_query(user_question, schema)
         st.code(sql_query, language="sql")
         
-        # Only allow SELECT queries
-        # 1. تنظيف النص والتحقق من نوع الاستعلام (دعم SELECT و WITH)
         clean_query_check = sql_query.lower().strip()
         allowed_starts = ("select", "with")
 
         if not clean_query_check.startswith(allowed_starts):
-            st.warning("LLM did not generate a valid SELECT or WITH query. Cannot execute.")
+            st.warning("LLM did not generate a valid SELECT or WITH query.")
             result_df = pd.DataFrame()
         else:
-            # 2. تنفيذ الاستعلام مع حل مشكلة التوافق
             try:
                 engine = get_db_engine()
                 with engine.connect() as conn:
-                    # يجب تمرير text(sql_query) داخل read_sql لحل خطأ sqlalchemy
                     result_df = pd.read_sql(text(sql_query), conn)
                 st.dataframe(result_df)
             except Exception as e:
                 st.error(f"Error executing SQL: {e}")
                 result_df = pd.DataFrame()
 
-        # Generate Natural Language Answer
         if not result_df.empty:
             answer = get_natural_language_response(user_question, result_df)
             st.markdown(f"**Answer:** {answer}")
